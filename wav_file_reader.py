@@ -24,10 +24,16 @@ wave-form peaks from the audio. This list can then be analysed to extract the bi
 """
 
 import logging
-import struct
-import wave
+import numpy as np
+import warnings
 
+from scipy import signal
+from scipy.io import wavfile
 from typing import List
+
+# This is a bit dangerous, but it's a pity the scipy developers feel the need to produce spam warnings every time they
+# see a WAV header field they don't recognise...
+warnings.filterwarnings("ignore", category=wavfile.WavFileWarning)
 
 
 class WavFileReader:
@@ -36,13 +42,15 @@ class WavFileReader:
     wave-form peaks from the audio. This list can then be analysed to extract the binary bits encoded on the tape.
     """
 
-    def __init__(self, input_filename: str):
+    def __init__(self, input_filename: str, min_wave_amplitude_fraction: float = 0.05):
         """
         Utility class to read WAV audio streams of old 8-bit computer tapes, and extract a list of zero-crossings or
         wave-form peaks from the audio.
 
         :param input_filename:
             Filename of the wav file to process.
+        :param min_wave_amplitude_fraction:
+            The minimum amplitude for a wave cycle to be counted, as a fraction of the highest signal on the tape.
         :return:
         """
 
@@ -50,28 +58,88 @@ class WavFileReader:
         self.input_filename = input_filename
 
         # Open wav file
-        self.wav_file = wave.open(self.input_filename, "rb")
+        self.sampling_frequency, self.wav_data_all_channels = wavfile.read(input_filename)
+
+        # If audio file is stereo, use the first available channel
+        if len(self.wav_data_all_channels.shape) > 1:
+            self.channels = len(self.wav_data_all_channels.shape)
+        else:
+            self.channels = 1  # For mono wav files, we get a 1D array
 
         # Populate metadata about the input audio stream
-        self.channels = self.wav_file.getnchannels()  # channel count
-        self.bit_width = self.wav_file.getsampwidth() * 8  # bits per sample
-        self.max_amplitude = pow(2, self.bit_width)  # frame value
-        self.sampling_frequency = self.wav_file.getframerate()  # Hz
-        self.frame_count = self.wav_file.getnframes()  # frame count
+        self.max_amplitude: float = 0  # frame value
+        self.frame_count: int = 0  # frame count
+        self.length: float = 0  # seconds
+        self.min_wave_amplitude_fraction: float = min_wave_amplitude_fraction
+        self.min_wave_amplitude_value: float = 0
+
+        # Keep track of position in file
+        self.position = 0
+
+        # Pointer to the channel we've selected to read
+        self.wav_data = None
+        self.select_channel(channel=0)
+
+        # Report metadata about the wav file
+        logging.info("Opened <{}>: {} channels, {} frames/sec, length {:.0f}m{:.1f}s".format(
+            self.input_filename, self.channels, self.sampling_frequency, self.length / 60, self.length % 60))
+
+    def select_channel(self, channel: int):
+        """
+        Select which channel of the audio we are to act on.
+
+        :param channel:
+            Number of channel, from 0 to <self.channels>
+        :return:
+            None
+        """
+
+        assert 0 <= channel < self.channels, "No such channel <{}>".format(channel)
+
+        # Select channel
+        if len(self.wav_data_all_channels.shape) > 1:
+            self.wav_data = self.wav_data_all_channels[:, channel]  # Convert 2D array into 1D array
+        else:
+            self.wav_data = self.wav_data_all_channels
+
+        # Populate metadata about the input audio stream
+        self.max_amplitude = np.max(self.wav_data)  # frame value
+        self.frame_count = self.wav_data.shape[0]  # frame count
         self.length = self.frame_count / self.sampling_frequency  # seconds
 
         # Calculate the minimum amplitude of a wave before we count it as a wave cycle
-        self.min_wave_amplitude_fraction = 0.05
         self.min_wave_amplitude_value = self.min_wave_amplitude_fraction * self.max_amplitude
 
-        # Report metadata about the wav file
-        logging.info("Opened <{}>: {} channels, {} bits wide, {} frames/sec, length {:.0f}m{:.1f}s".format(
-            self.input_filename, self.channels, self.bit_width, self.sampling_frequency,
-            self.length / 60, self.length % 60))
+        # Keep track of position in file
+        self.position = 0
 
-        # Check that wav file is 16-bit mono, the only format we currently support
-        assert self.channels == 1, "This script currently only supports 16-bit mono wav files"
-        assert self.bit_width == 16, "This script currently only supports 16-bit mono wav files"
+    def apply_high_pass_filter(self, cutoff: float):
+        """
+        Apply a high-pass Butterworth filter to remove low-frequency noise
+
+        :param cutoff:
+            The frequency of the filter cut-off / Hertz
+
+        :return:
+            None
+        """
+
+        def butter_highpass(cutoff, fs, order=5):
+            nyq = 0.5 * fs
+            normal_cutoff = cutoff / nyq
+            b, a = signal.butter(N=order, Wn=normal_cutoff, btype="high", analog=False)
+            return b, a
+
+        def butter_highpass_filter(data, cutoff, fs, order=5):
+            b, a = butter_highpass(cutoff, fs, order=order)
+            y = signal.filtfilt(b, a, data)
+            return y
+
+        # Apply high-pass filter
+        filtered_data = butter_highpass_filter(data=self.wav_data, cutoff=cutoff, fs=self.sampling_frequency)
+
+        # Replace original signal with filtered signal
+        self.wav_data = filtered_data
 
     def rewind(self):
         """
@@ -81,7 +149,7 @@ class WavFileReader:
             None
         """
 
-        self.wav_file.rewind()
+        self.position = 0
 
     def fetch_wav_file_sample(self, invert_wave: bool = False):
         """
@@ -93,19 +161,21 @@ class WavFileReader:
             A 16-bit signed integer value
         """
 
-        # Fetch a single frame from the wav file
-        wave_data = self.wav_file.readframes(1)
-        if len(wave_data) == 0:
+        # Check that we are within the bounds of the input data
+        if self.position < 0 or self.position >= len(self.wav_data):
             return None
 
-        # Extract value (assumes 16-bit mono)
-        frame_value = int(struct.unpack("<h", wave_data)[0])
+        # Fetch a single frame from the wav file
+        frame_value = self.wav_data[self.position]
 
         # Invert wave if requested
         if invert_wave:
             frame_value *= -1
 
-        # Return 16-bit signed integer
+        # Advance to the next frame in the file
+        self.position += 1
+
+        # Return the frame value
         return frame_value
 
     def fetch_zero_crossing_times(self, invert_wave: bool = False):
@@ -269,7 +339,7 @@ class WavFileReader:
 
         # If no file position was specified, determine the current position in the audio file
         if file_position is None:
-            file_position = self.wav_file.tell()
+            file_position = self.position
 
         # Convert file position (sample number) into a time-point measured in seconds
         file_time = file_position / self.sampling_frequency

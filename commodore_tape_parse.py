@@ -41,20 +41,19 @@ Limitations:
 * This script only reads files saved by the Commodore KERNAL, not turbo loading tapes (i.e. it will not read most
 commercial releases, but it will read most tapes you may have recorded yourself).
 
-* This script only accepts 16-bit mono wav files as input. Any bit rate is supported, but >= 44.1kHz is recommended.
-
-* This script is quite sensitive to low-frequency noise. You may be able to recover more files if you use audio-editing
-software (e.g. Adobe Audition or Audacity) to pass the input audio through a ~100-Hz high-pass filter before calling
-this script.
+* Any bit rate is supported, but >= 44.1kHz is recommended.
 
 References:
 
 These webpages contain a useful, though not entirely complete, guide to how the C64 stores data on tape:
 https://wav-prg.sourceforge.io/tape.html
+https://www.c64-wiki.com/wiki/Datassette_Encoding
 https://eden.mose.org.uk/download/Commodore%20Tape%20Format.pdf
 """
 
 import argparse
+import copy
+import itertools
 import logging
 import numpy as np
 import os
@@ -63,7 +62,7 @@ import sys
 
 from functools import reduce
 from operator import itemgetter
-from typing import List
+from typing import Dict, List, Sequence, Tuple
 
 from constants import ascii, cbm_display_codes
 from list_commodore_basic import create_listing_from_bytes
@@ -88,18 +87,130 @@ class WavCommodoreFileSearch:
         self.input_filename = input_filename
 
         # Open wav file
-        self.wav_file = WavFileReader(input_filename=self.input_filename)
+        self.wav_file = WavFileReader(input_filename=self.input_filename,
+                                      min_wave_amplitude_fraction=0.15)
+
+        # List of (channel, inversion) configurations
+        self.all_configs: List[Tuple[int, bool]] = list(itertools.product(range(self.wav_file.channels),
+                                                                          [False, True]))
 
     def search_wav_file(self):
         """
-        Entry point for searching for Commodore files from a wav recording of a Commodore datasette tape.
+        Main entry point for searching for Commodore files from a wav recording of a Commodore datasette tape.
 
+        :return:
+            List of file objects recovered
+        """
+
+        # Build a dictionary of all the chunks of data we recover with each configuration
+        chunks_recovered_by_config: Dict[int, List] = {}
+
+        # Search for files at each phase in turn
+        for config_id, (channel, inversion) in enumerate(self.all_configs):
+            logging.debug("Searching channel {:d} with inversion {:d}".format(channel, int(inversion)))
+            chunks_recovered_by_config[config_id] = self.search_for_files(channel=channel, inversion=bool(inversion))
+
+        # Add up total number of bytes recovered with each configuration
+        bytes_by_config: Dict[int, int] = {}
+        for config_id in range(len(self.all_configs)):
+            bytes_recovered: int = 0
+            for chunk in chunks_recovered_by_config[config_id]:
+                bytes_recovered += chunk['byte_count_without_error']
+            bytes_by_config[config_id] = bytes_recovered
+
+        # Merge the chunk lists we recovered with each configuration
+        sorted_config_ids: Sequence[int, int] = sorted(bytes_by_config.items(), key=itemgetter(1), reverse=True)
+
+        # Build merged list of all the chunks we recovered with each configuration
+        merged_chunk_list = []
+        timing_margin = 0.1  # maximum allowed mismatch between time position of a chunk seen at different phases (sec)
+
+        # Loop over all configurations
+        for config_id in [item[0] for item in sorted_config_ids]:
+            # Loop over all chunks recovered with each configuration
+            for chunk in chunks_recovered_by_config[config_id]:
+                # Fetch the start and end time of the chunk on the tape
+                time_start = chunk['start_time']
+                time_end = chunk['end_time']
+
+                # Check if chunk has already been recovered at a previous config setting
+                chunk_matches_index = None
+                action = None
+                for existing_chunk_index, existing_chunk in enumerate(merged_chunk_list):
+                    # ... to match, the end time of the new chunk can't be before the start of the old chunk
+                    if time_end < existing_chunk['start_time'] - timing_margin:
+                        continue
+                    # ... to match, the start time of the new chunk can't be after the end of the old chunk
+                    if time_start > existing_chunk['end_time'] + timing_margin:
+                        continue
+
+                    # We have a match
+                    chunk_matches_index = existing_chunk_index
+
+                    # If this chunk failed to load successfully, and the previous instance was OK, reject the new chunk
+                    if existing_chunk['pass_qc'] > chunk['pass_qc']:
+                        action = None
+                        break
+
+                    # If this chunk loaded successfully, and the previous instance didn't, replace previous instance
+                    if chunk['pass_qc'] > existing_chunk['pass_qc']:
+                        action = "replace"
+                        break
+
+                    # If this chunk recovered more bytes than the previous instance, replace previous instance
+                    if chunk['byte_count_without_error'] >= existing_chunk['byte_count_without_error']:
+                        action = "replace append"
+                        break
+
+                    # If this chunk was equally as good as the previous attempt to load it, simply increment the display
+                    # of which phases it was loaded at
+                    action = "append"
+                    break
+
+                # We have found a new chunk
+                if chunk_matches_index is None:
+                    chunk['config_ids'] = [config_id]
+                    merged_chunk_list.append(chunk)
+                # We have found a better version of an existing chunk
+                elif action == "replace":
+                    chunk['config_ids'] = [config_id]
+                    merged_chunk_list[chunk_matches_index] = chunk
+                # We have found an equally good version of an existing chunk; update list of phases where we found it
+                elif action == "append":
+                    merged_chunk_list[chunk_matches_index]['config_ids'].append(config_id)
+                # We have found a better version of an existing chunk, but it still didn't fully load properly
+                elif action == "replace append":
+                    config_ids = merged_chunk_list[chunk_matches_index]['config_ids'] + [config_id]
+                    chunk['config_ids'] = config_ids
+                    merged_chunk_list[chunk_matches_index] = chunk
+
+        # Sort list of the chunks we found by start time, to create chronological index of the tape
+        merged_chunk_list.sort(key=itemgetter('start_time'))
+
+        # Return a list of all the chunk objects we recovered
+        return merged_chunk_list
+
+    def search_for_files(self, channel: int, inversion: bool):
+        """
+        Search for Commodore files in a WAV audio stream, using a particular audio channel (left/right), and either
+        inverted, or not. Different tapes load better with different settings, due to the differing analogue audio
+        chain the signal has traversed, which can introduce phase shifts. To maximise the number of files
+        recovered, it is best to try all possibilities in turn.
+
+        :param channel:
+            Number of audio channel (left/right), from 0 to <self.wav_file.channels>, to search
+        :param inversion:
+            Boolean flag indicating whether to invert the audio stream before searching
         :return:
             List of file objects
         """
 
+        # Select which audio channel to search
+        self.wav_file.select_channel(channel=channel)
+        # self.wav_file.apply_high_pass_filter(cutoff=100)  # Apply high-pass filter
+
         # Fetch list of downward zero-crossing times of wav file.
-        zero_crossing_times = self.wav_file.fetch_zero_crossing_times()
+        zero_crossing_times = self.wav_file.fetch_zero_crossing_times(invert_wave=inversion)
 
         # Make list of pulse times and lengths.
         # A pulse is defined as the time interval spanned by a single wave cycle, measured from one downward zero
@@ -119,8 +230,8 @@ class WavCommodoreFileSearch:
         chunk_list = self._parse_byte_list(byte_list=byte_list)
 
         # Write a textual summary of the list of the chunks we found
-        chunk_description = self.write_list_of_chunks(chunk_list=chunk_list)
-        logging.info(chunk_description)
+        # chunk_description = self.write_list_of_chunks(chunk_list=chunk_list)
+        # logging.info(chunk_description)
 
         # Describe the detailed contents of the chunks we found
         # chunk_description = self.describe_chunks(chunk_list=chunk_list)
@@ -286,7 +397,7 @@ class WavCommodoreFileSearch:
         sample_count = end_index - start_index
         if sample_count > 1000:
             # Make histogram of pulse lengths
-            histogram = [0] * 700  # 700 histogram bins, each 1 clock-cycle wide
+            histogram = [0] * 850  # 850 histogram bins, each 1 clock-cycle wide
             for item in pulse_list[start_index: end_index]:
                 if 0 < item['length'] < len(histogram):
                     histogram[item['length']] += 1
@@ -483,15 +594,27 @@ class WavCommodoreFileSearch:
         # duplicate copy).
         synchronised = False
 
-        # Dictionary describing the current block we're reading
-        current_chunk = {'bytes': [], 'error_count': 0, 'start_time': 0, 'end_time': 0}
+        # Dictionary describing each block of data we find on the tape
+        blank_chunk_descriptor = {
+            'copy': 0,  # This is the first (0) or second (1) copy of this block
+            'bytes': [],  # Create a new empty buffer for the contents of the block
+            'byte_count': 0,  # Count the number of bytes in this block
+            'byte_count_without_error': 0,  # Count the number of error-free bytes in this block
+            'error_count': 0,  # Count the number of check-bit fails in this block
+            'start_time': 0,
+            'end_time': 0,
+            'config_ids': 0
+        }
+        current_chunk = copy.deepcopy(blank_chunk_descriptor)
 
         # Cycle through the bytes on the tape, one by one, assembling bytes into blocks
         for item in byte_list:
             # Start a new chunk if we've lost synchronisation (or had a delay longer than 0.1 seconds)
             if item['sync_lost'] or item['time'] > current_chunk['end_time'] + 0.1:
                 synchronised = False
-                current_chunk = {'bytes': [], 'error_count': 0, 'start_time': item['time'], 'end_time': item['time']}
+                current_chunk = copy.deepcopy(blank_chunk_descriptor)
+                current_chunk['start_time'] = item['time']
+                current_chunk['end_time'] = item['time']
 
             # Feed the current byte into current chunk
             current_chunk['bytes'].append(item['byte'])
@@ -504,26 +627,24 @@ class WavCommodoreFileSearch:
             if not synchronised:
                 # If we see the byte sequence $84 $83 $82 $81, this indicates the start of the first copy of a block
                 if current_chunk['bytes'][-4:] == [0x84, 0x83, 0x82, 0x81]:
+                    # Start recording bytes into a new, empty, chunk descriptor
                     synchronised = True
-                    current_chunk = {
-                        'copy': 0,  # This is the first copy of this block
-                        'bytes': [],  # Create a new empty buffer for the contents of the block
-                        'error_count': 0,  # Count the number of check-bit fails in this block
-                        'start_time': item['time'],
-                        'end_time': item['time']
-                    }
+                    current_chunk = copy.deepcopy(blank_chunk_descriptor)
+                    current_chunk['copy'] = 0
+                    current_chunk['start_time'] = item['time']
+                    current_chunk['end_time'] = item['time']
+
                     # Append this block to the list of block we will return from this function
                     output_chunk_list.append(current_chunk)
                 # If we see the byte sequence $04 $03 $02 $01, this indicates the start of the second copy of a block
                 if current_chunk['bytes'][-4:] == [0x04, 0x03, 0x02, 0x01]:
+                    # Start recording bytes into a new, empty, chunk descriptor
                     synchronised = True
-                    current_chunk = {
-                        'copy': 1,  # This is the second (duplicate) copy of this block
-                        'bytes': [],  # Create a new empty buffer for the contents of the block
-                        'error_count': 0,  # Count the number of check-bit fails in this block
-                        'start_time': item['time'],
-                        'end_time': item['time']
-                    }
+                    current_chunk = copy.deepcopy(blank_chunk_descriptor)
+                    current_chunk['copy'] = 1
+                    current_chunk['start_time'] = item['time']
+                    current_chunk['end_time'] = item['time']
+
                     # Append this block to the list of block we will return from this function
                     output_chunk_list.append(current_chunk)
 
@@ -547,6 +668,8 @@ class WavCommodoreFileSearch:
 
             # Populate the 'length' metadata field with the number of bytes in the block
             item['length'] = len(item['bytes'])
+            item['byte_count'] = item['length']
+            item['byte_count_without_error'] = item['length'] if item['pass_qc'] else 0
 
             # Create a hexadecimal hash for the contents of this block; we use this to easily check whether blocks
             # are exact duplicates.
@@ -558,7 +681,10 @@ class WavCommodoreFileSearch:
             if item['pass_qc']:
                 # Blocks of length $C0 bytes are probably headers
                 if item['length'] == 0xc0:
-                    item['type'] = 'HEAD'
+                    if item['bytes'][0] == 2:
+                        item['type'] = 'SEQ_'
+                    else:
+                        item['type'] = 'HEAD'
                 # Blocks of any other length probably contain a data payload
                 else:
                     item['type'] = 'DATA'
@@ -566,8 +692,7 @@ class WavCommodoreFileSearch:
         # Return list of all the blocks of data we found on the tape, each described by a dictionary of properties
         return output_chunk_list
 
-    @staticmethod
-    def write_list_of_chunks(chunk_list: List):
+    def write_list_of_chunks(self, chunk_list: List):
         """
         Output human-readable text describing all the blocks of data we found on the tape, and whether the checksums /
         check-bits in each block were OK.
@@ -582,23 +707,36 @@ class WavCommodoreFileSearch:
         output = ""
 
         # Write column headings
-        output += "[{:10s} - {:10s}] {:12s} {:4s}; {:6s}      {}\n".format(
-            "Start/sec", "End/sec", "Copy  Length", "Type", "Hash", "Information"
+        output += "[{:10s} - {:10s}] {:12s} {:4s} [{:6s}] {:6s}      {}\n".format(
+            "Start/sec", "End/sec", "Copy  Length", "Type", "Config", "Hash", "Information"
         )
 
         # Write list of chunks we found
         for item in chunk_list:
             suffix = ""
 
+            # Make an indication of which configurations recovered this file
+            config_indicator = ""
+            for config_id in range(len(self.all_configs)):
+                if config_id in item['config_ids']:
+                    config_indicator += "ABCDEFGH"[config_id]
+                else:
+                    config_indicator += "-"
+
             # For header chunks, append a suffix with the filename from the header
             if item['type'] == "HEAD":
                 filename = "".join(cbm_display_codes[byte] for byte in item['bytes'][5:]).strip()
-                suffix = "; filename <{}>".format(filename)
+                suffix = "; type <{:02x}> filename <{}>".format(item['bytes'][0], filename)
+
+            # For sequential data, append a suffix showing the payload
+            elif item['type'] == "SEQ_":
+                payload = "".join(cbm_display_codes[byte] for byte in item['bytes'][5:]).strip()
+                suffix = "; type <{:02x}> payload {:d} bytes".format(item['bytes'][0], len(payload))
 
             # Write line of information about this chunk of data
-            output += "[{:10.5f} - {:10.5f}] {:01d} {:04x} bytes {}; {:06x} hash{}\n".format(
+            output += "[{:10.5f} - {:10.5f}] {:01d} {:04x} bytes {} [{:6s}] {:06x} hash{}\n".format(
                 item['start_time'], item['end_time'], item['copy'], len(item['bytes']),
-                item['type'], item['chunk_hash'], suffix
+                item['type'], config_indicator, item['chunk_hash'], suffix
             )
 
         # Return output string
@@ -652,24 +790,26 @@ class WavCommodoreFileSearch:
                 last_copy_zero_hash = item['chunk_hash']
 
             # Ignore chunks with read errors
-            if item['type'] not in ("HEAD", "DATA"):
+            if item['type'] not in ("HEAD", "DATA", "SEQ_"):
                 continue
 
             # If chunk is a HEADer, it is either a filename, or some SEQ data
             if item['type'] == "HEAD":
                 filename = "".join(cbm_display_codes[byte] for byte in item['bytes'][5:]).strip()
-                # Test if we have a filename
-                if len(filename) < 16:
-                    # If SEQ buffer contains data, save that before proceeding
-                    if len(seq) > 0:
-                        write_file(item_filename=latest_filename, item_bytes=seq, file_index=extracted_file_index)
-                        extracted_file_index += 1
-                    # Save the new filename we've just received
-                    latest_filename = filename
-                    seq = ""
-                else:
-                    # We have some more SEQ data
-                    seq += filename
+
+                # If SEQ buffer contains data, save that before proceeding
+                if len(seq) > 0:
+                    write_file(item_filename=latest_filename, item_bytes=seq, file_index=extracted_file_index)
+                    extracted_file_index += 1
+
+                # Save the new filename we've just received
+                latest_filename = filename
+                seq = ""
+
+            # If chunk is sequential data, it contains a chunk of ASCII data
+            elif item['type'] == "SEQ_":
+                payload = "".join(cbm_display_codes[byte] for byte in item['bytes'][5:]).strip()
+                seq += payload
 
             # If chunk is DATA, then it is a file
             else:
@@ -678,11 +818,18 @@ class WavCommodoreFileSearch:
                     write_file(item_filename=latest_filename, item_bytes=seq, file_index=extracted_file_index)
                     extracted_file_index += 1
                     latest_filename = "<untitled>"
+
                 # Save the file we've just found
                 write_file(item_filename=latest_filename, item_bytes=item['bytes'], file_index=extracted_file_index)
                 extracted_file_index += 1
-                latest_filename = "<untitled>"
+                latest_filename += "_"  # Add an underscore if we find another version of this file
                 seq = ""
+
+        # Write final SEQ chunk, if one exists
+        if len(seq) > 0:
+            # If SEQ buffer contains data, save that before proceeding
+            write_file(item_filename=latest_filename, item_bytes=seq, file_index=extracted_file_index)
+            extracted_file_index += 1
 
     @staticmethod
     def describe_chunks(chunk_list: List):
@@ -724,6 +871,12 @@ class WavCommodoreFileSearch:
                 output += "# File type   : {:02x}\n".format(file_type)
                 output += "# Load address: {:04x}\n".format(load_addr)
                 output += "# End address : {:04x}\n".format(end_addr)
+                output += "# Length      : {:04x}\n".format(length)
+            elif item['type'] == "SEQ_":
+                file_type = item['bytes'][0]
+                length = len(item['bytes'])
+                output += "# -- SEQ --\n"
+                output += "# File type   : {:02x}\n".format(file_type)
                 output += "# Length      : {:04x}\n".format(length)
             elif item['type'] == "DATA":
                 # For DATA blocks, attempt to LIST them as BASIC programs, if possible
@@ -773,7 +926,7 @@ if __name__ == "__main__":
     # Read input parameters
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input',
-                        required=True,
+                        default="/mnt/ganymede4/dcf21/cassette_archive/drawer_br/drawer_br_tape02a_c16_basic1.wav",
                         type=str,
                         dest="input_filename",
                         help="Input WAV file to process")
@@ -802,6 +955,10 @@ if __name__ == "__main__":
 
     # Search for Commodore files
     chunk_list = processor.search_wav_file()
+
+    # Write a textual summary of the list of the chunks we found
+    chunk_description = processor.write_list_of_chunks(chunk_list=chunk_list)
+    logging.info(chunk_description)
 
     # Extract the Commodore files we found to output
     processor.extract_files(chunk_list=chunk_list, output_dir=args.output_directory)
