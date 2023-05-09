@@ -1,15 +1,14 @@
-#!../../auto/virtualenv/bin/python3
 # -*- coding: utf-8 -*-
 # wav_file_reader.py
 #
 # The Python script in this file provides a utility class for extracting files
 # from WAV recordings containing the audio of tapes recorded by 8-bit computers.
 #
-# Copyright (C) 2022 Dominic Ford <https://dcford.org.uk/>
+# Copyright (C) 2022-2023 Dominic Ford <https://dcford.org.uk/>
 #
 # This code is free software; you can redistribute it and/or modify it under
 # the terms of the GNU General Public License as published by the Free Software
-# Foundation; either version 2 of the License, or (at your option) any later
+# Foundation; either version 3 of the License, or (at your option) any later
 # version.
 #
 # You should have received a copy of the GNU General Public License along with
@@ -313,7 +312,7 @@ class WavFileReader:
 
         pulse_list = []  # List of all the pulses (wave cycles) we found
 
-        # Loop through all of the input events which signify the start of a new wave cycle
+        # Loop through all the input events which signify the start of a new wave cycle
         for i in range(1, len(input_events)):
             # Calculate the time elapsed since the start of the previous wave cycle
             pulse_length = input_events[i] - input_events[i - 1]

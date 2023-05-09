@@ -6,11 +6,11 @@
 # produced by the Commodore 64, Commodore 16, etc. It supports all the BASIC
 # extensions added in the Commodore 128.
 #
-# Copyright (C) 2022 Dominic Ford <https://dcford.org.uk/>
+# Copyright (C) 2022-2023 Dominic Ford <https://dcford.org.uk/>
 #
 # This code is free software; you can redistribute it and/or modify it under
 # the terms of the GNU General Public License as published by the Free Software
-# Foundation; either version 2 of the License, or (at your option) any later
+# Foundation; either version 3 of the License, or (at your option) any later
 # version.
 #
 # You should have received a copy of the GNU General Public License along with

@@ -7,11 +7,11 @@
 # Plus/4 and C128). These will typically have been recorded using a
 # Commodore 1530 / C2N / 1531 datasette.
 #
-# Copyright (C) 2022 Dominic Ford <https://dcford.org.uk/>
+# Copyright (C) 2022-2023 Dominic Ford <https://dcford.org.uk/>
 #
 # This code is free software; you can redistribute it and/or modify it under
 # the terms of the GNU General Public License as published by the Free Software
-# Foundation; either version 2 of the License, or (at your option) any later
+# Foundation; either version 3 of the License, or (at your option) any later
 # version.
 #
 # You should have received a copy of the GNU General Public License along with
@@ -23,7 +23,7 @@
 """
 This Python script extracts binary files from WAV recordings of audio cassette tapes recorded by 8-bit Commodore
 computers (e.g. C64, C16, Plus/4 and C128). These will typically have been recorded using a Commodore 1530 / C2N / 1531
-datasette.
+datasette. It can return the files either in raw form, or as a TAP file for use in Commodore emulators such as VICE.
 
 This script was used by the author to recover all the Commodore tapes archived on the website
 <https://files.dcford.org.uk/>.
@@ -36,12 +36,16 @@ By default, this script simply exports all the files to a specified output direc
 is required, it is simple to call the <WavCommodoreFileSearch> class from an external script to perform other actions
 on the files found.
 
-Limitations:
+Usage:
 
-* This script only reads files saved by the Commodore KERNAL, not turbo loading tapes (i.e. it will not read most
-commercial releases, but it will read most tapes you may have recorded yourself).
+* This script can convert any tape into TAP format for use in an emulator such as VICE. However, the functions to
+extract the raw contents of files will only recover files saved by theCommodore KERNAL, not turbo loading tapes
+(i.e. it cannot extract the contents of most commercial releases, though you can load them into an emulator as a
+TAP file).
 
-* Any bit rate is supported, but >= 44.1kHz is recommended.
+* Any bit rate is supported, but >= 44.1kHz is recommended. Both mono and stereo recordings are accepted, but stereo
+is recommended, and the best channel will automatically be selected -- very often one channel is (much) less noisy
+than the other.
 
 References:
 
@@ -62,7 +66,7 @@ import sys
 
 from functools import reduce
 from operator import itemgetter
-from typing import Dict, List, Sequence, Tuple
+from typing import Dict, List, Tuple
 
 from constants import ascii, cbm_display_codes
 from list_commodore_basic import create_listing_from_bytes
@@ -74,21 +78,41 @@ class WavCommodoreFileSearch:
     Class to extract Commodore files from wav recordings of Commodore datasette tapes.
     """
 
-    def __init__(self, input_filename: str):
+    def __init__(self, input_filename: str, fix_play_speed: bool = False):
         """
         Extract binary files from WAV recordings of Commodore datasette tapes (e.g. Commodore 64 tapes).
 
         :param input_filename:
             Filename of the wav file to process
-        :return:
+        :param fix_play_speed:
+            Boolean indicating whether we estimate the true play speed of the tape, and correct the play speed if the
+            recording is at the wrong speed.
         """
 
         # Input settings
-        self.input_filename = input_filename
+        self.input_filename: str = input_filename
+        self.fix_play_speed: bool = fix_play_speed
+
+        # Clock-period to assume to calculating the length of wave cycles
+        # This is 1/8th of the CPU speed of the computer
+        self.tape_clock_period: float = 1. / 123156
+        self.histogram_bins_per_cycle: float = 2.
+
+        # Default break-points to use in the categorisation of S, M and L pulses (these are copied from Vice)
+        # These are measured in cycles - 1/8th of the CPU clock frequency
+        self.default_sm_breakpoint: int = 0x37
+        self.default_ml_breakpoint: int = 0x4A
 
         # Open wav file
-        self.wav_file = WavFileReader(input_filename=self.input_filename,
-                                      min_wave_amplitude_fraction=0.15)
+        self.wav_file: WavFileReader = WavFileReader(input_filename=self.input_filename,
+                                                     min_wave_amplitude_fraction=0.15)
+
+        # Place-holder for the list of pulses extracted from this WAV file. This pulse list can be used to generate a
+        # TAP file, after called <search_wav_file>
+        self.best_pulse_list: List[Dict] = []
+
+        # Store an estimate of the play-speed of this tape compared to normal (used for writing TAP files)
+        self.tape_play_speed: float = 1.
 
         # List of (channel, inversion) configurations
         self.all_configs: List[Tuple[int, bool]] = list(itertools.product(range(self.wav_file.channels),
@@ -104,11 +128,20 @@ class WavCommodoreFileSearch:
 
         # Build a dictionary of all the chunks of data we recover with each configuration
         chunks_recovered_by_config: Dict[int, List] = {}
+        pulses_recovered_by_config: Dict[int, List[Dict]] = {}
+        mean_tape_speed_by_config: Dict[int, List[float]] = {}
 
         # Search for files at each phase in turn
         for config_id, (channel, inversion) in enumerate(self.all_configs):
             logging.debug("Searching channel {:d} with inversion {:d}".format(channel, int(inversion)))
-            chunks_recovered_by_config[config_id] = self.search_for_files(channel=channel, inversion=bool(inversion))
+            x: tuple = self.search_for_files(channel=channel, inversion=bool(inversion))
+            chunks_recovered_by_config[config_id] = x[0]
+            pulses_recovered_by_config[config_id] = x[1]
+            mean_tape_speed_by_config[config_id] = x[2]
+
+        # Store mean clock period, which we use to normalise the pulse lengths if we're asked to make a TAP file
+        if self.fix_play_speed:
+            self.tape_play_speed = np.mean(list(mean_tape_speed_by_config.values()))
 
         # Add up total number of bytes recovered with each configuration
         bytes_by_config: Dict[int, int] = {}
@@ -119,7 +152,11 @@ class WavCommodoreFileSearch:
             bytes_by_config[config_id] = bytes_recovered
 
         # Merge the chunk lists we recovered with each configuration
-        sorted_config_ids: Sequence[int, int] = sorted(bytes_by_config.items(), key=itemgetter(1), reverse=True)
+        sorted_config_ids: List[Tuple[int, int]] = sorted(bytes_by_config.items(), key=itemgetter(1), reverse=True)
+
+        # Store the best pulse list - which we may use later to generate a TAP file using <self.write_tap_file>
+        best_config_id = sorted_config_ids[0][0]
+        self.best_pulse_list = pulses_recovered_by_config[best_config_id]
 
         # Build merged list of all the chunks we recovered with each configuration
         merged_chunk_list = []
@@ -202,7 +239,7 @@ class WavCommodoreFileSearch:
         :param inversion:
             Boolean flag indicating whether to invert the audio stream before searching
         :return:
-            List of file objects
+            List of [chunk_list, pulse_list, tape_play_speed]
         """
 
         # Select which audio channel to search
@@ -229,6 +266,13 @@ class WavCommodoreFileSearch:
         # Turn stream of bytes into a list of continuous blocks of data where we remained synchronised to bit stream
         chunk_list = self._parse_byte_list(byte_list=byte_list)
 
+        # Estimate tape play speed relative to normal
+        if len(byte_list) > 0:
+            mean_sm_breakpoint: float = float(np.mean([item['sm_breakpoint'] for item in byte_list]))
+            tape_play_speed: float = self.default_sm_breakpoint / mean_sm_breakpoint
+        else:
+            tape_play_speed = 1
+
         # Write a textual summary of the list of the chunks we found
         # chunk_description = self.write_list_of_chunks(chunk_list=chunk_list)
         # logging.info(chunk_description)
@@ -240,14 +284,12 @@ class WavCommodoreFileSearch:
         # Write debugging output
         # self._write_debugging(pulse_list=categorised_pulse_list, byte_list=byte_list)
 
-        return chunk_list
+        return chunk_list, pulse_list, tape_play_speed
 
-    @staticmethod
-    def _normalise_pulse_list(pulse_list: List):
+    def _normalise_pulse_list(self, pulse_list: List):
         """
         Normalize the list of pulses (periods between downward zero-crossings of the tape waveform) by converting their
-        lengths from seconds into a number of computer clock cycles. We empirically estimate the clock speed based on
-        the pitch of the header tone, and so it doesn't matter if the playback speed in the wav file is somewhat wrong.
+        lengths from seconds into a number of computer clock cycles.
 
         :param pulse_list:
             Input list of pulses derived from <__fetch_pulse_list>
@@ -255,56 +297,40 @@ class WavCommodoreFileSearch:
             A list of dictionaries describing the intervals.
         """
 
-        # The number of seconds of tape corresponding to one clock cycle. We define a clock cycle as 1/200 of the
-        # header tone frequency
-        tape_clock_period = None
-
         # Time point in the tape when we last made a measurement of the clock frequency.
-        last_clock_update_time = None
+        last_header_tone_time = None
 
-        # Loop through the wave cycles found on the tape, looking for header tones ...
-        # ... as we do this, we also populate the 'length' metadata field on each cycle, with the pulse length in clock
-        # cycles, based on the frequency of the most recent header tone.
+        # Loop through the wave cycles found on the tape, looking for header tones.
+        # As we do this, we also populate the 'length' metadata field on each cycle, with the length in clock cycles.
         for index, item in enumerate(pulse_list):
-            # Boolean flag indicating whether we have made a new estimate of the clock frequency on this pulse
-            updated_clock = False
+            # Boolean flag indicating whether we have hit a header tone
+            detected_header = False
+
             # Only check for a header tone once every 100 samples (this is slow, and header tones should be long)
             if index % 100 == 0:
-                # If we have a continuous tone, use that to adjust the assumed clock period
+                # If we have a continuous tone, this may be a header tone
                 # Test if next 500 samples have a very consistent period
                 test_header = [item['length_sec'] for item in pulse_list[index: index + 500]]
                 header_mean_period = np.mean(test_header)
                 header_std_dev_period = np.std(test_header)
                 # ... if the standard deviation of the next 500 wave cycles is less than 2.5%, it looks like a header
                 if header_std_dev_period < header_mean_period * 0.025:
-                    # Normalise the frequency of the header tone to 200 clock cycles per wave cycle
-                    new_tape_clock_period = header_mean_period / 200
+                    # Report the frequency of the header tone
+                    header_tone_frequency = 1 / header_mean_period
 
-                    # Reject this clock change if it is very similar to existing clock period (don't produce endless
-                    # messages about clock updates for no reason).
-                    fractional_clock_change = 1
-                    if tape_clock_period is not None:
-                        fractional_clock_change = abs(new_tape_clock_period - tape_clock_period) / new_tape_clock_period
+                    # Only update the clock if the change is more than 2%, or we've gone 30 sec since last update
+                    if (last_header_tone_time is None) or (item['time'] - last_header_tone_time > 30):
+                        last_header_tone_time = item['time']
+                        detected_header = True
+                        logging.debug("[{:10.5f}] Header tone with frequency {:.2f} Hz; std={:.6f}".format(
+                            item['time'], header_tone_frequency, header_std_dev_period / header_mean_period))
 
-                    # Only update the clock if the change is more than 2%, or we've gone 10 sec since last update
-                    if ((last_clock_update_time is None) or (fractional_clock_change > 0.02) or
-                            (item['time'] - last_clock_update_time > 10)):
-                        updated_clock = True
-                        tape_clock_period = new_tape_clock_period
-                        last_clock_update_time = item['time']
-                        logging.debug("[{:10.5f}] Updated clock period to {:.6f} ms; std={:.6f}".format(
-                            item['time'], tape_clock_period * 1e3, header_std_dev_period / header_mean_period))
-
-            # If we have previously encountered a header tone and estimated the clock frequency, use that to
-            # convert the length of each pulse (in seconds) to a length in clock cycles
-            if tape_clock_period is None:
-                pulse_cycles = 0
-            else:
-                pulse_cycles = round(item['length_sec'] / tape_clock_period)
+            # Convert the length of each pulse (in seconds) to a length in clock cycles
+            pulse_cycles: float = item['length_sec'] / self.tape_clock_period
 
             # Update the descriptor for each pulse with a normalised duration in clock cycles
             item['length'] = pulse_cycles  # Length of pulse in clock cycles
-            item['clock_updated'] = updated_clock  # Boolean flag indicating a new clock frequency measurement
+            item['header_break'] = detected_header  # Boolean flag indicating a break for a header tone
 
         # Return pulse list, with the 'length' and 'clock_updated' fields populated on each pulse.
         return pulse_list
@@ -324,23 +350,26 @@ class WavCommodoreFileSearch:
 
         # Analyse the histogram of pulse lengths in the first data block on the tape, to estimate the best initial
         # threshold lengths to use for S, M, L pulses
+        start_time: float = 0
         pulse_types = self._analyse_pulse_length_histogram(pulse_list=pulse_list, start_index=0)
 
         # Start building a histogram of the types of pulses we've found on the tape. This is not necessary, but it's
         # useful for diagnostics.
-        default_pulse_type_histogram = {'?': 0, 's': 0, 'm': 0, 'l': 0, '<': 0, '>': 0}
+        default_pulse_type_histogram: Dict[str, int] = {'?': 0, 's': 0, 'm': 0, 'l': 0, '<': 0, '>': 0}
 
         # Create a new initial pulse type histogram
-        pulse_type_histogram = default_pulse_type_histogram.copy()
+        pulse_type_histogram: Dict[str, int] = default_pulse_type_histogram.copy()
 
         # Cycle through the entire tape, categorising all the pulses (wave cycles) as S, M or L
         for index, item in enumerate(pulse_list):
-            # If we hit a header tone / an updated clock frequency, then do a new histogram analysis to determine
+            # If we hit a header tone, then do a new histogram analysis to determine
             # the best thresholds to use for S, M and L pulses
-            if item['clock_updated']:
-                logging.debug("Pulse type histogram: {}".format(repr(pulse_type_histogram)))
+            if item['header_break']:
+                logging.debug("[{:10.5f} - {:10.5f}] Pulse type histogram: {}".format(
+                    start_time, item['time'], repr(pulse_type_histogram)))
                 pulse_type_histogram = default_pulse_type_histogram.copy()
                 pulse_types = self._analyse_pulse_length_histogram(pulse_list=pulse_list, start_index=index)
+                start_time = item['time']
 
             # See which category this pulse falls into. If it doesn't fall into any category, label it as ?
             pulse_cycles = item['length']
@@ -352,18 +381,19 @@ class WavCommodoreFileSearch:
 
             # Record the pulse categorisation in the 'type' metadata field
             item['type'] = pulse_type
+            item['sm_breakpoint'] = pulse_types['s']['max']
 
             # Move on to the next wave cycle on the tape
             pulse_type_histogram[pulse_type] += 1
 
         # Log the histogram of types of pulse
-        logging.debug("Pulse type histogram: {}".format(repr(pulse_type_histogram)))
+        logging.debug("[{:10.5f} - {:10.5f}] Pulse type histogram: {}".format(
+            start_time, pulse_list[-1]['time'], repr(pulse_type_histogram)))
 
         # Return pulse list, now with the 'type' field populated on each pulse.
         return pulse_list
 
-    @staticmethod
-    def _analyse_pulse_length_histogram(pulse_list: List, start_index: int):
+    def _analyse_pulse_length_histogram(self, pulse_list: List, start_index: int):
         """
         Analyse the histogram of the lengths of pulses within a data block to determine the most likely break points
         between short, medium and long pulses. The break points are placed in the largest gaps in the histogram, as
@@ -378,29 +408,33 @@ class WavCommodoreFileSearch:
         """
 
         # Calculate the time point on the tape where we start our analysis
-        start_time_sec = pulse_list[start_index]['time']
+        start_time_sec: float = pulse_list[start_index]['time']
 
-        # Default pulse boundaries to use (these are based on C16 tapes)
-        s_min = 100.
-        m_min = 300.
-        l_min = 470.
-        l_max = 900.
+        # Default pulse boundaries to use (these are based on the defaults assumed by Vice)
+        s_min: float = 0x10  # VICE uses 0x24
+        m_min: float = self.default_sm_breakpoint
+        l_min: float = self.default_ml_breakpoint
+        l_max: float = 0xF0  # VICE uses 0x64
+
+        # Number of histogram bins (sets the maximum length of pulses at the top-end of the histogram
+        histogram_bins: int = int(180 * self.histogram_bins_per_cycle)
 
         # Measure extent of block until next clock change. We only analyse the sequence of wave cycles until the clock
         # change - i.e. until the next header tone.
-        end_index = start_index + 1
-        # The flag 'clock_updated' indicates a header tone and a new clock frequency determination
-        while end_index < len(pulse_list) and not pulse_list[end_index]['clock_updated']:
+        end_index: int = start_index + 1
+        # The flag 'header_break' indicates a header tone and so a new file which may have been recorded separately
+        while end_index < len(pulse_list) and not pulse_list[end_index]['header_break']:
             end_index += 1
 
         # Only proceed if we have more than 1000 wave cycles (no valid data block can have less than this!)
         sample_count = end_index - start_index
         if sample_count > 1000:
             # Make histogram of pulse lengths
-            histogram = [0] * 850  # 850 histogram bins, each 1 clock-cycle wide
+            histogram = [0] * histogram_bins  # histogram bins, each 1/self.histogram_bins_per_cycle clock cycles wide
             for item in pulse_list[start_index: end_index]:
-                if 0 < item['length'] < len(histogram):
-                    histogram[item['length']] += 1
+                bin_number: int = int(item['length'] * self.histogram_bins_per_cycle)
+                if 0 < bin_number < len(histogram):
+                    histogram[bin_number] += 1
 
             # Normalise histogram so that all the bins add to one
             histogram = [item / sample_count for item in histogram]
@@ -408,7 +442,7 @@ class WavCommodoreFileSearch:
             # Look for long strings of poorly-populated bins in the histogram
             h_index = int(s_min)  # Index within the histogram as we scan through. We start at 100.
             zero_strings = []  # Dictionaries describing each string of zeros
-            threshold = 1e-3  # Bins are defined as poorly populated if they are below this weight
+            threshold = 0.004  # Bins are defined as poorly populated if they are below this weight
 
             # Cycle through the histogram, bin by bin
             while h_index < len(histogram):
@@ -447,15 +481,22 @@ class WavCommodoreFileSearch:
                 zero_strings = zero_strings[:3]
                 zero_strings.sort(key=itemgetter('start'), reverse=False)
                 # Take the center-points of these three gaps as the thresholds to use
-                s_min = zero_strings[0]['center']
-                m_min = zero_strings[1]['center']
-                l_min = zero_strings[2]['center']
-            # If debugging, dump the full histogram for the user to peer at if they want to do diagnostics
-            logging.debug("[{:10.5f}] Pulse length histogram: {}".format(start_time_sec, repr(histogram)))
+                s_min = zero_strings[0]['center'] / self.histogram_bins_per_cycle
+                m_min = zero_strings[1]['center'] / self.histogram_bins_per_cycle
+                l_min = zero_strings[2]['center'] / self.histogram_bins_per_cycle
 
-        # Print a status message about the new thresholds we have adopted
-        logging.debug("[{:10.5f}] Updated S/M/L breakpoints: {:.0f}, {:.0f}, {:.0f}, based on {:d} samples".
-                      format(start_time_sec, s_min, m_min, l_min, sample_count))
+            # If debugging, dump the full histogram for the user to peer at if they want to do diagnostics
+            histogram_display = copy.deepcopy(histogram)
+            while len(histogram_display) > 0 and histogram_display[-1] == 0:
+                histogram_display.pop()  # Remove trailing zeros from histogram
+            logging.debug("[{:10.5f}] Pulse length histogram: {}".format(start_time_sec, repr(histogram_display)))
+
+            # Print a status message about the new thresholds we have adopted
+            logging.debug("[{:10.5f}] Updated S/M/L breakpoints: {:.1f}, {:.1f}, {:.1f}, based on {:d} samples".
+                          format(start_time_sec, s_min, m_min, l_min, sample_count))
+        else:
+            # Print a status message about the new thresholds we have adopted
+            logging.debug("[{:10.5f}] Using default S/M/L breakpoints".format(start_time_sec))
 
         # Dictionary of the different kinds of pulses (wave cycles) that we may find on the type, together with the
         # minimum and maximum allowed lengths for each kind of pulse
@@ -497,6 +538,7 @@ class WavCommodoreFileSearch:
         while position < len(pulse_list) - 1:
             # Process pulse pair
             pulse_time = pulse_list[position]['time']
+            pulse_sm_breakpoint = pulse_list[position]['sm_breakpoint']
             pulse_pair = pulse_list[position]['type'] + pulse_list[position + 1]['type']
 
             # The sequence LM signifies the start of a new byte (also accept LL)
@@ -557,6 +599,7 @@ class WavCommodoreFileSearch:
                     'time': byte_start_time,
                     'byte': byte_value,
                     'check_bit_ok': check_ok,
+                    'sm_breakpoint': pulse_sm_breakpoint,
                     'sync_lost': sync_lost
                 })
                 # Empty the bit assembly buffer
@@ -725,7 +768,7 @@ class WavCommodoreFileSearch:
 
             # For header chunks, append a suffix with the filename from the header
             if item['type'] == "HEAD":
-                filename = "".join(cbm_display_codes[byte] for byte in item['bytes'][5:]).strip()
+                filename = "".join(cbm_display_codes[byte] for byte in item['bytes'][5:5 + 16]).strip()
                 suffix = "; type <{:02x}> filename <{}>".format(item['bytes'][0], filename)
 
             # For sequential data, append a suffix showing the payload
@@ -831,6 +874,46 @@ class WavCommodoreFileSearch:
             write_file(item_filename=latest_filename, item_bytes=seq, file_index=extracted_file_index)
             extracted_file_index += 1
 
+    def write_tap_file(self, filename: str):
+        """
+        Write a .tap file representation of the data we found, enabling this tape to be loaded into emulators.
+
+        :param filename:
+            Filename of the binary TAP file we should write
+        :return:
+            None
+        """
+
+        if len(self.best_pulse_list) == 0:
+            logging.info("Writing empty .tap file. Did you call <self.search_wav_file> first to parse the tape?")
+
+        # First compile output into a buffer
+        output = bytearray()
+
+        output.extend("C64-TAPE-RAW".encode("ascii"))  # ID header
+        output.append(0)  # TAP format version
+        output.extend([0, 0, 0, 0])  # Reserved
+
+        # Write length of TAP file as 32-bit little-endian int
+        l = len(self.best_pulse_list)
+        output.append(l & 0xFF)
+        output.append((l >> 8) & 0xFF)
+        output.append((l >> 16) & 0xFF)
+        output.append((l >> 24) & 0xFF)
+
+        # Output pulse lengths
+        time_unit = self.tape_clock_period / self.tape_play_speed
+        for item in self.best_pulse_list:
+            length_sec = item['length_sec']
+            length_int = length_sec / time_unit
+            if not 0 < length_int < 255:
+                length_int = 0
+            output.append(int(length_int))
+
+        # Write binary file
+        with open(filename, "wb") as f_out:
+            f_out.write(output)
+
     @staticmethod
     def describe_chunks(chunk_list: List):
         """
@@ -926,7 +1009,7 @@ if __name__ == "__main__":
     # Read input parameters
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--input',
-                        default="/mnt/ganymede4/dcf21/cassette_archive/drawer_br/drawer_br_tape02a_c16_basic1.wav",
+                        default="/tmp/drawer_br_tape01b_c16_rolf_harris.wav",
                         type=str,
                         dest="input_filename",
                         help="Input WAV file to process")
@@ -935,11 +1018,24 @@ if __name__ == "__main__":
                         type=str,
                         dest="output_directory",
                         help="Directory in which to put the extracted files")
+    parser.add_argument('--tap',
+                        default="/tmp/my_computer_tape.tap",
+                        type=str,
+                        dest="output_tap_file",
+                        help="Filename for TAP file containing the contents of the tape")
     parser.add_argument('--debug',
                         action='store_true',
                         dest="debug",
                         help="Show full debugging output")
-    parser.set_defaults(debug=False)
+    parser.add_argument('--fix-play-speed',
+                        action='store_true',
+                        dest="fix_play_speed",
+                        help="Try to fix the play speed of the tape, in case the recording is at the wrong speed")
+    parser.add_argument('--no-fix-play-speed',
+                        action='store_false',
+                        dest="fix_play_speed",
+                        help="Don't try to fix the play speed of the tape, in case the recording is at the wrong speed")
+    parser.set_defaults(debug=False, fix_play_speed=False)
     args = parser.parse_args()
 
     # Set up a logging object
@@ -948,10 +1044,10 @@ if __name__ == "__main__":
                         format='[%(asctime)s] %(levelname)s:%(filename)s:%(message)s',
                         datefmt='%d/%m/%Y %H:%M:%S')
     logger = logging.getLogger(__name__)
-    logger.debug(__doc__.strip())
+    # logger.debug(__doc__.strip())
 
     # Open input audio file
-    processor = WavCommodoreFileSearch(input_filename=args.input_filename)
+    processor = WavCommodoreFileSearch(input_filename=args.input_filename, fix_play_speed=args.fix_play_speed)
 
     # Search for Commodore files
     chunk_list = processor.search_wav_file()
@@ -962,3 +1058,7 @@ if __name__ == "__main__":
 
     # Extract the Commodore files we found to output
     processor.extract_files(chunk_list=chunk_list, output_dir=args.output_directory)
+
+    # Make tap file
+    if args.output_tap_file:
+        processor.write_tap_file(filename=args.output_tap_file)
