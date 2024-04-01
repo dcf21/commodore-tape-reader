@@ -7,7 +7,7 @@
 # Plus/4 and C128). These will typically have been recorded using a
 # Commodore 1530 / C2N / 1531 datasette.
 #
-# Copyright (C) 2022-2023 Dominic Ford <https://dcford.org.uk/>
+# Copyright (C) 2022-2024 Dominic Ford <https://dcford.org.uk/>
 #
 # This code is free software; you can redistribute it and/or modify it under
 # the terms of the GNU General Public License as published by the Free Software
@@ -78,12 +78,14 @@ class WavCommodoreFileSearch:
     Class to extract Commodore files from wav recordings of Commodore datasette tapes.
     """
 
-    def __init__(self, input_filename: str, fix_play_speed: bool = False):
+    def __init__(self, input_filename: str, machine: str, fix_play_speed: bool = False):
         """
         Extract binary files from WAV recordings of Commodore datasette tapes (e.g. Commodore 64 tapes).
 
         :param input_filename:
             Filename of the wav file to process
+        :param machine:
+            The machine that the tape is targeted for. Options: c64, c128, c16, plus4.
         :param fix_play_speed:
             Boolean indicating whether we estimate the true play speed of the tape, and correct the play speed if the
             recording is at the wrong speed.
@@ -91,6 +93,7 @@ class WavCommodoreFileSearch:
 
         # Input settings
         self.input_filename: str = input_filename
+        self.machine: str = machine
         self.fix_play_speed: bool = fix_play_speed
 
         # Clock-period to assume to calculating the length of wave cycles
@@ -100,8 +103,17 @@ class WavCommodoreFileSearch:
 
         # Default break-points to use in the categorisation of S, M and L pulses (these are copied from Vice)
         # These are measured in cycles - 1/8th of the CPU clock frequency
-        self.default_sm_breakpoint: int = 0x37
-        self.default_ml_breakpoint: int = 0x4A
+        if self.machine not in ('c16', 'plus4'):
+            self.default_smin_breakpoint: int = 0x10  # VICE uses 0x24
+            self.default_sm_breakpoint: int = 0x37
+            self.default_ml_breakpoint: int = 0x4A
+            self.default_lmax_breakpoint: int = 0xF0  # VICE uses 0x64
+        else:
+            # https://plus4world.powweb.com/plus4encyclopedia/500247
+            self.default_smin_breakpoint: int = 0x10
+            self.default_sm_breakpoint: int = 100
+            self.default_ml_breakpoint: int = 180
+            self.default_lmax_breakpoint: int = 300
 
         # Open wav file
         self.wav_file: WavFileReader = WavFileReader(input_filename=self.input_filename,
@@ -129,7 +141,7 @@ class WavCommodoreFileSearch:
         # Build a dictionary of all the chunks of data we recover with each configuration
         chunks_recovered_by_config: Dict[int, List] = {}
         pulses_recovered_by_config: Dict[int, List[Dict]] = {}
-        mean_tape_speed_by_config: Dict[int, List[float]] = {}
+        mean_tape_speed_by_config: Dict[int, float] = {}
 
         # Search for files at each phase in turn
         for config_id, (channel, inversion) in enumerate(self.all_configs):
@@ -199,7 +211,7 @@ class WavCommodoreFileSearch:
                         action = "replace append"
                         break
 
-                    # If this chunk was equally as good as the previous attempt to load it, simply increment the display
+                    # If this chunk was equally good as the previous attempt to load it, simply increment the display
                     # of which phases it was loaded at
                     action = "append"
                     break
@@ -411,13 +423,13 @@ class WavCommodoreFileSearch:
         start_time_sec: float = pulse_list[start_index]['time']
 
         # Default pulse boundaries to use (these are based on the defaults assumed by Vice)
-        s_min: float = 0x10  # VICE uses 0x24
+        s_min: float = self.default_smin_breakpoint
         m_min: float = self.default_sm_breakpoint
         l_min: float = self.default_ml_breakpoint
-        l_max: float = 0xF0  # VICE uses 0x64
+        l_max: float = self.default_lmax_breakpoint
 
         # Number of histogram bins (sets the maximum length of pulses at the top-end of the histogram
-        histogram_bins: int = int(180 * self.histogram_bins_per_cycle)
+        histogram_bins: int = int(360 * self.histogram_bins_per_cycle)
 
         # Measure extent of block until next clock change. We only analyse the sequence of wave cycles until the clock
         # change - i.e. until the next header tone.
@@ -427,10 +439,10 @@ class WavCommodoreFileSearch:
             end_index += 1
 
         # Only proceed if we have more than 1000 wave cycles (no valid data block can have less than this!)
-        sample_count = end_index - start_index
+        sample_count: int = end_index - start_index
         if sample_count > 1000:
-            # Make histogram of pulse lengths
-            histogram = [0] * histogram_bins  # histogram bins, each 1/self.histogram_bins_per_cycle clock cycles wide
+            # Make histogram of pulse lengths, each bin 1/self.histogram_bins_per_cycle clock cycles wide
+            histogram: List[float] = [0] * histogram_bins
             for item in pulse_list[start_index: end_index]:
                 bin_number: int = int(item['length'] * self.histogram_bins_per_cycle)
                 if 0 < bin_number < len(histogram):
@@ -440,50 +452,49 @@ class WavCommodoreFileSearch:
             histogram = [item / sample_count for item in histogram]
 
             # Look for long strings of poorly-populated bins in the histogram
-            h_index = int(s_min)  # Index within the histogram as we scan through. We start at 100.
-            zero_strings = []  # Dictionaries describing each string of zeros
-            threshold = 0.004  # Bins are defined as poorly populated if they are below this weight
+            h_index: int = int(s_min)  # Index within the histogram as we scan through. We start at 100.
+            zero_strings: List[dict] = []  # Dictionaries describing each string of zeros
+            threshold: float = 0.004  # Bins are defined as poorly populated if they are below this weight
 
             # Cycle through the histogram, bin by bin
             while h_index < len(histogram):
                 # This bin is poorly populated if it's below the threshold occupation
                 if histogram[h_index] < threshold:
                     # Scan rightwards through the histogram to find the next bin that is well populated
-                    h_start = h_index
+                    h_start: int = h_index
                     while h_index < len(histogram) and histogram[h_index] < threshold:
                         h_index += 1
-                    h_end = h_index
+                    h_end: int = h_index
                     # We have found a gap, from h_start to h_end.
                     # But don't include the long gap at the top of the histogram
                     if h_end < len(histogram):
                         # Add a dictionary to <zero_strings> describing this gap in the histogram
-                        string_length = h_end - h_start
-                        string_center = (h_start + h_end) / 2
-                        # We assign a 'weight' to each gap - broadly its length, but with a slight bias towards shorter
-                        # time intervals (the long pulses can have quite variable lengths, and we don't care about that)
-                        string_weight = string_length / (string_center + 250)
+                        string_length: int = h_end - h_start
+                        string_center: float = (h_start + h_end) / 2 / self.histogram_bins_per_cycle
+                        # We assign a 'weight' to each gap - using its length
+                        string_weight: float = string_length
                         zero_strings.append({
-                            'start': h_start,
-                            'end': h_end,
-                            'length': string_length,
-                            'center': string_center,
-                            'weight': string_weight
+                            'start': h_start,  # in histogram bins
+                            'end': h_end,  # in histogram bins
+                            'length': string_length,  # in histogram bins
+                            'center': string_center,  # in cycles, not histogram bins
+                            'weight': string_weight,
+                            'sm_offset': abs(string_center - self.default_sm_breakpoint) / (2 + string_weight),
+                            'ml_offset': abs(string_center - self.default_ml_breakpoint) / (2 + string_weight)
                         })
                 # Move rightwards looking for the next gap in the histogram.
                 # If we found a gap, then continue from the far end of the gap
                 h_index += 1
 
-            # Look for three longest strings of poorly-populated bins, with a slight bias towards shorter intervals
+            # Look for the strings of poorly-populated bins that are closest to where we expect to see SM and ML cut
+            logging.debug("[{:10.5f}] Gaps: {}".format(start_time_sec, repr([i['center'] for i in zero_strings])))
             if len(zero_strings) > 3:
-                # Sort the gaps in the histogram by weight
-                zero_strings.sort(key=itemgetter('weight'), reverse=True)
-                # We take the longest three gaps to be the break-points to the left of S, M and L peaks of histogram
-                zero_strings = zero_strings[:3]
-                zero_strings.sort(key=itemgetter('start'), reverse=False)
-                # Take the center-points of these three gaps as the thresholds to use
-                s_min = zero_strings[0]['center'] / self.histogram_bins_per_cycle
-                m_min = zero_strings[1]['center'] / self.histogram_bins_per_cycle
-                l_min = zero_strings[2]['center'] / self.histogram_bins_per_cycle
+                zero_strings.sort(key=itemgetter('sm_offset'))
+                m_min = zero_strings[0]['center']
+                zero_strings.pop(0)
+
+                zero_strings.sort(key=itemgetter('ml_offset'))
+                l_min = zero_strings[0]['center']
 
             # If debugging, dump the full histogram for the user to peer at if they want to do diagnostics
             histogram_display = copy.deepcopy(histogram)
@@ -1023,6 +1034,11 @@ if __name__ == "__main__":
                         type=str,
                         dest="output_tap_file",
                         help="Filename for TAP file containing the contents of the tape")
+    parser.add_argument('--machine',
+                        default="c64",
+                        type=str, choices=('c64', 'c128', 'c16', 'plus4'),
+                        dest="machine",
+                        help="Machine that the tape is targeted for")
     parser.add_argument('--debug',
                         action='store_true',
                         dest="debug",
@@ -1047,7 +1063,9 @@ if __name__ == "__main__":
     # logger.debug(__doc__.strip())
 
     # Open input audio file
-    processor = WavCommodoreFileSearch(input_filename=args.input_filename, fix_play_speed=args.fix_play_speed)
+    processor = WavCommodoreFileSearch(input_filename=args.input_filename,
+                                       machine=args.machine,
+                                       fix_play_speed=args.fix_play_speed)
 
     # Search for Commodore files
     chunk_list = processor.search_wav_file()

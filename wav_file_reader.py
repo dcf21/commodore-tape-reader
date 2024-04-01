@@ -4,7 +4,7 @@
 # The Python script in this file provides a utility class for extracting files
 # from WAV recordings containing the audio of tapes recorded by 8-bit computers.
 #
-# Copyright (C) 2022-2023 Dominic Ford <https://dcford.org.uk/>
+# Copyright (C) 2022-2024 Dominic Ford <https://dcford.org.uk/>
 #
 # This code is free software; you can redistribute it and/or modify it under
 # the terms of the GNU General Public License as published by the Free Software
@@ -57,7 +57,11 @@ class WavFileReader:
         self.input_filename = input_filename
 
         # Open wav file
-        self.sampling_frequency, self.wav_data_all_channels = wavfile.read(input_filename)
+        if input_filename is not None:
+            self.sampling_frequency, self.wav_data_all_channels = wavfile.read(input_filename)
+        else:
+            self.sampling_frequency = 1
+            self.wav_data_all_channels = np.asarray([0])
 
         # If audio file is stereo, use the first available channel
         if len(self.wav_data_all_channels.shape) > 1:
@@ -80,8 +84,9 @@ class WavFileReader:
         self.select_channel(channel=0)
 
         # Report metadata about the wav file
-        logging.info("Opened <{}>: {} channels, {} frames/sec, length {:.0f}m{:.1f}s".format(
-            self.input_filename, self.channels, self.sampling_frequency, self.length / 60, self.length % 60))
+        if input_filename is not None:
+            logging.info("Opened <{}>: {} channels, {} frames/sec, length {:.0f}m{:.1f}s".format(
+                self.input_filename, self.channels, self.sampling_frequency, self.length / 60, self.length % 60))
 
     def select_channel(self, channel: int):
         """
